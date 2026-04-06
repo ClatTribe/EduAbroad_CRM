@@ -27,42 +27,113 @@ export async function POST(req: NextRequest) {
 
     switch (action) {
       case 'student_registered': {
-        // Student registered on the portal — create lead in CRM
-        const { name, phone, email, city, portalUserId } = body.data || {}
-        const cleanPhone = (phone || '').replace(/\D/g, '').slice(-10)
+        const d = body.data || {}
+        const cleanPhone = (d.phone || '').replace(/\D/g, '').slice(-10)
 
-        // Duplicate check
+        // ── Build notes from rich portal fields ──
+        const notesParts: string[] = []
+        if (d.tenthBoard || d.tenthYear)
+          notesParts.push(`10th: ${[d.tenthBoard, d.tenthYear].filter(Boolean).join(', ')}`)
+        if (d.twelfthBoard || d.twelfthYear || d.twelfthStream)
+          notesParts.push(`12th: ${[d.twelfthBoard, d.twelfthYear, d.twelfthStream].filter(Boolean).join(', ')}`)
+        if (d.ugDegree || d.ugUniversity || d.ugYear)
+          notesParts.push(`UG: ${[d.ugDegree, d.ugField, d.ugUniversity, d.ugYear, d.ugScore ? `CGPA ${d.ugScore}` : ''].filter(Boolean).join(' | ')}`)
+        if (d.pgDegree || d.pgUniversity || d.pgYear)
+          notesParts.push(`PG: ${[d.pgDegree, d.pgField, d.pgUniversity, d.pgYear, d.pgScore ? `Score ${d.pgScore}` : ''].filter(Boolean).join(' | ')}`)
+        if (d.extracurricular)
+          notesParts.push(`Extracurriculars: ${d.extracurricular}`)
+        if (d.preferredCourse)
+          notesParts.push(`Preferred course: ${d.preferredCourse}`)
+        if (d.contactPreferences?.length)
+          notesParts.push(`Contact preference: ${Array.isArray(d.contactPreferences) ? d.contactPreferences.join(', ') : d.contactPreferences}`)
+
+        // ── Build work experience string ──
+        let workExp = ''
+        if (d.hasExperience) {
+          workExp = [
+            d.experienceYears ? `${d.experienceYears} years` : '',
+            d.experienceField || '',
+          ].filter(Boolean).join(' in ')
+        }
+
+        // ── Normalise test scores: [{exam, score}] → {IELTS: {score, date}} ──
+        let testScores: Record<string, { score: string; date: string }> = {}
+        if (Array.isArray(d.testScores)) {
+          for (const t of d.testScores) {
+            if (t.exam && t.score) testScores[t.exam] = { score: t.score, date: '' }
+          }
+        } else if (d.testScores && typeof d.testScores === 'object') {
+          testScores = d.testScores
+        }
+
+        // ── Full lead row ──
+        const leadRow = {
+          name: d.name || '',
+          phone: cleanPhone,
+          email: d.email || '',
+          city: d.city || '',
+          state: d.state || '',
+          source: d.source || 'Portal',
+          stage: 'New Enquiry',
+          lead_status: 'active',
+          portal_user_id: d.portalUserId || '',
+          intended_degree: d.intendedDegree || '',
+          target_intake: d.targetIntake || '',
+          destination_countries: d.destinationCountries || [],
+          budget: d.budget || '',
+          field_of_study: d.fieldOfStudy || '',
+          tenth_marks: d.tenthMarks || '',
+          twelfth_marks: d.twelfthMarks || '',
+          ug_cgpa: d.ugCGPA || d.ugScore || '',
+          test_scores: testScores,
+          work_experience: workExp,
+          notes: notesParts.join('\n'),
+          // Attribution
+          google_click_id: d.googleClickId || '',
+          utm_source: d.utmSource || '',
+          utm_medium: d.utmMedium || '',
+          utm_campaign: d.utmCampaign || '',
+          created_at: Date.now(),
+          user_id: userId,
+        }
+
+        // ── Duplicate check ──
         if (cleanPhone) {
-          const { data: existing } = await supabase.from('leads').select('id').like('phone', `%${cleanPhone}%`).limit(1)
+          const { data: existing } = await supabase
+            .from('leads')
+            .select('id')
+            .like('phone', `%${cleanPhone}%`)
+            .limit(1)
+
           if (existing && existing.length > 0) {
-            // Update existing lead with portal user ID
-            await supabase.from('leads').update({ portal_user_id: portalUserId || '' }).eq('id', existing[0].id)
-            return NextResponse.json({ success: true, message: 'Updated existing lead', leadId: existing[0].id })
+            // Update existing lead with all new portal data (excluding stage/status)
+            const { id } = existing[0]
+            const { created_at, stage, lead_status, ...updateFields } = leadRow
+            await supabase.from('leads').update(updateFields).eq('id', id)
+            return NextResponse.json({ success: true, message: 'Updated existing lead', leadId: id })
           }
         }
 
+        // ── Create new lead ──
         const newLeadId = `portal-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
-        await supabase.from('leads').insert({
-          id: newLeadId,
-          name: name || '',
-          phone: cleanPhone,
-          email: email || '',
-          city: city || '',
-          source: 'Portal',
-          stage: 'New Enquiry',
-          created_at: Date.now(),
-          portal_user_id: portalUserId || '',
-          lead_status: 'active',
-          user_id: userId,
-        })
+        const { error } = await supabase.from('leads').insert({ id: newLeadId, ...leadRow })
+        if (error) {
+          console.error('Portal lead creation error:', error)
+          return NextResponse.json({ error: 'Failed to create lead' }, { status: 500 })
+        }
+
         return NextResponse.json({ success: true, leadId: newLeadId })
       }
 
       case 'document_uploaded': {
-        // Student uploaded a document on portal
         const { portalUserId, documentType, fileName } = body.data || {}
         if (portalUserId) {
-          const { data: leads } = await supabase.from('leads').select('id, documents').eq('portal_user_id', portalUserId).limit(1)
+          const { data: leads } = await supabase
+            .from('leads')
+            .select('id, documents')
+            .eq('portal_user_id', portalUserId)
+            .limit(1)
+
           if (leads && leads.length > 0) {
             const documents = leads[0].documents || []
             const existingDoc = documents.findIndex((d: any) => d.documentType === documentType)
@@ -79,10 +150,14 @@ export async function POST(req: NextRequest) {
       }
 
       case 'counselling_booked': {
-        // Student booked a counselling session on portal
         const { portalUserId, scheduledAt, notes } = body.data || {}
         if (portalUserId) {
-          const { data: leads } = await supabase.from('leads').select('id, conversations, stage').eq('portal_user_id', portalUserId).limit(1)
+          const { data: leads } = await supabase
+            .from('leads')
+            .select('id, conversations, stage')
+            .eq('portal_user_id', portalUserId)
+            .limit(1)
+
           if (leads && leads.length > 0) {
             const conversations = leads[0].conversations || []
             conversations.push({
